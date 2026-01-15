@@ -1,5 +1,5 @@
 import { useState, useEffect, useContext, useMemo } from "react";
-import { useParams } from "react-router-dom";
+import { useParams, useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import InviteUser from "../components/InviteUser";
 import CreateTask from "../components/CreateTask";
@@ -22,12 +22,15 @@ import {
   FiMail,
   FiChevronRight,
   FiCheck,
-  FiArrowLeft
+  FiArrowLeft,
+  FiTrash2,
+  FiAlertTriangle
 } from "react-icons/fi";
 import { HiOutlineSparkles, HiOutlineShieldCheck } from "react-icons/hi";
 
 export default function WorkspaceDetails() {
   const { id } = useParams();
+  const navigate = useNavigate();
   const { profile } = useContext(AuthContext);
   const { currentWorkspace, inviteUserByEmail } = useContext(WorkspaceContext);
   
@@ -50,6 +53,16 @@ export default function WorkspaceDetails() {
   const [inviteError, setInviteError] = useState("");
   const [isInviteLoading, setIsInviteLoading] = useState(false);
   const [recentInvites, setRecentInvites] = useState([]);
+  
+  // Custom confirmation modal state
+  const [showConfirmModal, setShowConfirmModal] = useState(false);
+  const [memberToRemove, setMemberToRemove] = useState(null);
+  const [cleanupStatus, setCleanupStatus] = useState(null);
+  const [isCleaningUp, setIsCleaningUp] = useState(false);
+
+  // Real-time updates state
+  const [dataVersion, setDataVersion] = useState(0);
+  const [realtimeChannel, setRealtimeChannel] = useState(null);
 
   // Check if user is admin
   const isAdmin = profile?.role === "admin";
@@ -261,47 +274,317 @@ export default function WorkspaceDetails() {
     }
   };
 
-  // Remove member from workspace
-  const handleRemoveMember = async (memberId, memberName) => {
-    if (!isAdmin) {
-      alert("Only admins can remove members");
-      return;
-    }
-
-    if (memberId === profile?.id) {
-      alert("You cannot remove yourself from the workspace");
-      return;
-    }
-
-    if (!confirm(`Are you sure you want to remove ${memberName} from this workspace?`)) {
-      return;
-    }
-
-    setRemovingMemberId(memberId);
+  // Check if user has permission to view/access this workspace
+  const checkUserPermission = async () => {
+    if (!id || !profile?.id) return false;
+    
     try {
+      const { data, error } = await supabase
+        .from('workspace_members')
+        .select('user_id')
+        .eq('workspace_id', id)
+        .eq('user_id', profile.id)
+        .single();
+      
+      return !error && data;
+    } catch (error) {
+      console.error("Error checking permission:", error);
+      return false;
+    }
+  };
+
+  // Function to completely delete user's tasks
+  const deleteUserTasks = async (memberId, workspaceId) => {
+    try {
+      // First, get all task IDs that are assigned to this user or created by this user
+      const { data: userTasks, error: fetchError } = await supabase
+        .from('tasks')
+        .select('id')
+        .eq('workspace_id', workspaceId)
+        .or(`assigned_to.eq.${memberId},created_by.eq.${memberId}`);
+
+      if (fetchError) throw fetchError;
+
+      if (userTasks && userTasks.length > 0) {
+        const taskIds = userTasks.map(task => task.id);
+        
+        // First delete related data (attachments, comments, activities) for these tasks
+        if (taskIds.length > 0) {
+          // Delete task attachments
+          const { error: attachmentsError } = await supabase
+            .from('task_attachments')
+            .delete()
+            .in('task_id', taskIds);
+
+          if (attachmentsError) throw attachmentsError;
+
+          // Delete task comments
+          const { error: commentsError } = await supabase
+            .from('task_comments')
+            .delete()
+            .in('task_id', taskIds);
+
+          if (commentsError) throw commentsError;
+        }
+
+        // Delete the tasks themselves
+        const { error: tasksError } = await supabase
+          .from('tasks')
+          .delete()
+          .in('id', taskIds);
+
+        if (tasksError) throw tasksError;
+      }
+
+      // Also delete tasks where user is assigned_to but not the creator
+      const { error: assignedTasksError } = await supabase
+        .from('tasks')
+        .delete()
+        .eq('workspace_id', workspaceId)
+        .eq('assigned_to', memberId);
+
+      if (assignedTasksError) throw assignedTasksError;
+
+      console.log(`Deleted all tasks for user ${memberId} in workspace ${workspaceId}`);
+      return true;
+    } catch (error) {
+      console.error("Error deleting user tasks:", error);
+      return false;
+    }
+  };
+
+  // Function to delete user's comments and attachments
+  const deleteUserCommentsAndAttachments = async (memberId, workspaceId) => {
+    try {
+      // Get all task IDs from this workspace
+      const { data: workspaceTasks, error: tasksError } = await supabase
+        .from('tasks')
+        .select('id')
+        .eq('workspace_id', workspaceId);
+      
+      if (tasksError) throw tasksError;
+      
+      if (workspaceTasks && workspaceTasks.length > 0) {
+        const taskIds = workspaceTasks.map(task => task.id);
+        
+        if (taskIds.length > 0) {
+          // Delete comments by this user on any task in this workspace
+          const { error: commentsError } = await supabase
+            .from('task_comments')
+            .delete()
+            .in('task_id', taskIds)
+            .eq('user_id', memberId);
+
+          if (commentsError) throw commentsError;
+
+          // Delete attachments uploaded by this user for any task in this workspace
+          const { error: attachmentsError } = await supabase
+            .from('task_attachments')
+            .delete()
+            .in('task_id', taskIds)
+            .eq('uploaded_by', memberId);
+
+          if (attachmentsError) throw attachmentsError;
+        }
+      }
+
+      console.log(`Deleted comments and attachments for user ${memberId}`);
+      return true;
+    } catch (error) {
+      console.error("Error deleting user comments and attachments:", error);
+      return false;
+    }
+  };
+
+  // Function to delete user's activity history
+  const deleteUserActivityHistory = async (memberId, workspaceId) => {
+    try {
+      // For task_activities, we need to go through tasks first
+      try {
+        // Get all task IDs from this workspace
+        const { data: workspaceTasks, error: tasksError } = await supabase
+          .from('tasks')
+          .select('id')
+          .eq('workspace_id', workspaceId);
+        
+        if (!tasksError && workspaceTasks && workspaceTasks.length > 0) {
+          const taskIds = workspaceTasks.map(task => task.id);
+          
+          if (taskIds.length > 0) {
+            // Try to delete task activities by this user
+            try {
+              const { error: taskActivitiesError } = await supabase
+                .from('task_activities')
+                .delete()
+                .in('task_id', taskIds)
+                .eq('user_id', memberId);
+              
+              if (taskActivitiesError) {
+                console.warn("Could not delete task activities:", taskActivitiesError);
+              }
+            } catch (e) {
+              console.warn("Error with task_activities table:", e);
+            }
+          }
+        }
+      } catch (taskActivityError) {
+        console.warn("Error accessing task_activities:", taskActivityError);
+      }
+
+      console.log(`Deleted activity history for user ${memberId}`);
+      return true;
+    } catch (error) {
+      console.error("Error deleting user activity history:", error);
+      return false;
+    }
+  };
+
+  // Function to refresh workspace data
+  const refreshWorkspaceData = async () => {
+    if (!id) return;
+    
+    try {
+      const [members, tasksStats, pendingInvites] = await Promise.all([
+        fetchWorkspaceMembers(id),
+        fetchTasksStats(id),
+        fetchPendingInvites(id)
+      ]);
+
+      setWorkspaceStats({
+        totalTasks: tasksStats.totalTasks,
+        completedTasks: tasksStats.completedTasks,
+        membersCount: members.length,
+        pendingInvites: pendingInvites.count
+      });
+      
+      await fetchActivities(id);
+    } catch (error) {
+      console.error("Error refreshing workspace data:", error);
+    }
+  };
+
+  // Updated cleanupUserData function with real-time updates
+  const cleanupUserData = async (memberId, memberName, workspaceId) => {
+    setIsCleaningUp(true);
+    setCleanupStatus("Deleting user's tasks...");
+    
+    try {
+      // Step 1: Delete user's tasks
+      setCleanupStatus("Deleting user's tasks...");
+      const tasksDeleted = await deleteUserTasks(memberId, workspaceId);
+      
+      if (!tasksDeleted) {
+        throw new Error("Failed to delete user tasks");
+      }
+      
+      // Force immediate UI update
+      setDataVersion(prev => prev + 1);
+      
+      setCleanupStatus("Deleting comments and attachments...");
+      
+      // Step 2: Delete user's comments and attachments
+      const commentsDeleted = await deleteUserCommentsAndAttachments(memberId, workspaceId);
+      
+      if (!commentsDeleted) {
+        console.warn("Could not delete all comments and attachments");
+      }
+      
+      setCleanupStatus("Deleting activity history...");
+      
+      // Step 3: Delete user's activity history
+      const activitiesDeleted = await deleteUserActivityHistory(memberId, workspaceId);
+      
+      if (!activitiesDeleted) {
+        console.warn("Could not delete all activity history");
+      }
+      
+      setCleanupStatus("Removing from workspace...");
+      
+      // Step 4: Remove user from workspace_members
       const { error } = await supabase
         .from('workspace_members')
         .delete()
-        .eq('workspace_id', id)
+        .eq('workspace_id', workspaceId)
         .eq('user_id', memberId);
       
       if (error) throw error;
       
-      // Refresh members list
-      await fetchWorkspaceMembers(id);
+      // Force immediate refresh of all data
+      await refreshWorkspaceData();
+      setDataVersion(prev => prev + 1);
       
-      // Update stats
-      setWorkspaceStats(prev => ({
-        ...prev,
-        membersCount: prev.membersCount - 1
-      }));
-
-      alert(`${memberName} has been removed from the workspace`);
+      console.log(`Removed ${memberName} from workspace ${workspaceId}`);
+      return true;
+      
     } catch (error) {
-      console.error("Error removing member:", error);
-      alert("Failed to remove member. Please try again.");
+      console.error("Error in cleanup:", error);
+      
+      // Even if there were errors, try to remove from workspace_members
+      try {
+        const { error: removeError } = await supabase
+          .from('workspace_members')
+          .delete()
+          .eq('workspace_id', workspaceId)
+          .eq('user_id', memberId);
+        
+        if (!removeError) {
+          // Force refresh even if only partially successful
+          await refreshWorkspaceData();
+          setDataVersion(prev => prev + 1);
+          console.log(`Still removed ${memberName} from workspace_members despite cleanup errors`);
+          return true; // Consider it success if at least removed from workspace
+        }
+      } catch (finalError) {
+        console.error("Failed to remove from workspace_members:", finalError);
+      }
+      
+      throw new Error("Failed to completely clean up user data");
+      
     } finally {
-      setRemovingMemberId(null);
+      setIsCleaningUp(false);
+      setCleanupStatus(null);
+    }
+  };
+
+  // Show confirmation modal
+  const showRemoveConfirmation = (memberId, memberName) => {
+    setMemberToRemove({ id: memberId, name: memberName });
+    setShowConfirmModal(true);
+  };
+
+  // Handle member removal after confirmation
+  const handleRemoveConfirmed = async () => {
+    if (!memberToRemove || !isAdmin) {
+      setShowConfirmModal(false);
+      setMemberToRemove(null);
+      return;
+    }
+
+    try {
+      const success = await cleanupUserData(
+        memberToRemove.id, 
+        memberToRemove.name, 
+        id
+      );
+      
+      if (success) {
+        // If removed user is current user, redirect
+        if (memberToRemove.id === profile?.id) {
+          navigate('/workspaces');
+          return;
+        }
+        
+        // Show success message
+        setShowConfirmModal(false);
+        setMemberToRemove(null);
+        
+        // Force refresh of TaskBoard component
+        setDataVersion(prev => prev + 1);
+      }
+    } catch (error) {
+      console.error("Failed to remove member:", error);
+      setShowConfirmModal(false);
+      setMemberToRemove(null);
     }
   };
 
@@ -347,6 +630,70 @@ export default function WorkspaceDetails() {
     }
   };
 
+  // Setup real-time subscriptions
+  useEffect(() => {
+    if (!id) return;
+
+    // Subscribe to workspace changes
+    const channel = supabase
+      .channel(`workspace-${id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'tasks',
+          filter: `workspace_id=eq.${id}`
+        },
+        () => {
+          // Force refresh when tasks change
+          setDataVersion(prev => prev + 1);
+          refreshWorkspaceData();
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'workspace_members',
+          filter: `workspace_id=eq.${id}`
+        },
+        () => {
+          // Force refresh when members change
+          setDataVersion(prev => prev + 1);
+          refreshWorkspaceData();
+        }
+      )
+      .subscribe((status) => {
+        console.log('Realtime subscription status:', status);
+      });
+
+    setRealtimeChannel(channel);
+
+    // Cleanup on unmount
+    return () => {
+      if (channel) {
+        supabase.removeChannel(channel);
+      }
+    };
+  }, [id]);
+
+  // Check user permission on component mount and when workspace changes
+  useEffect(() => {
+    const verifyPermission = async () => {
+      const hasPermission = await checkUserPermission();
+      if (!hasPermission) {
+        navigate('/workspaces');
+      }
+    };
+
+    if (id && profile?.id) {
+      verifyPermission();
+    }
+  }, [id, profile?.id, navigate, dataVersion]);
+
+  // Load initial data
   useEffect(() => {
     const loadWorkspaceData = async () => {
       if (!id) return;
@@ -377,23 +724,60 @@ export default function WorkspaceDetails() {
     };
 
     loadWorkspaceData();
-  }, [id]);
+  }, [id, dataVersion]); // Add dataVersion to dependency array
 
   const tabContent = useMemo(() => {
+    // Check permission before showing tabs
+    const hasPermission = workspaceMembers.some(member => member.user_id === profile?.id);
+    
+    if (!hasPermission && profile?.id) {
+      return (
+        <div className="text-center py-12">
+          <FiAlertTriangle className="w-12 h-12 text-yellow-500 mx-auto mb-3" />
+          <h3 className="text-lg font-semibold text-gray-900">Access Denied</h3>
+          <p className="text-gray-600 mt-1">You are no longer a member of this workspace</p>
+          <button
+            onClick={() => navigate('/workspaces')}
+            className="mt-4 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700"
+          >
+            Go to Workspaces
+          </button>
+        </div>
+      );
+    }
+
     switch(activeTab) {
       case "tasks":
-        return <TaskBoard workspaceId={id} userRole={profile?.role} />;
+        return <TaskBoard 
+          workspaceId={id} 
+          userRole={profile?.role} 
+          key={`tasks-${dataVersion}`} // Force re-render on dataVersion change
+        />;
       case "activities":
-        return <ActivitiesSection activities={activities} workspaceId={id} />;
+        return <ActivitiesSection 
+          activities={activities} 
+          workspaceId={id} 
+          key={`activities-${dataVersion}`}
+        />;
       case "invite":
-        // For non-admin users, show simplified invite component
-        return <InviteUser workspaceId={id} members={workspaceMembers} />;
+        return <InviteUser 
+          workspaceId={id} 
+          members={workspaceMembers} 
+          key={`invite-${dataVersion}`}
+        />;
       case "create":
-        return <CreateTask workspaceId={id} />;
+        return <CreateTask 
+          workspaceId={id} 
+          key={`create-${dataVersion}`}
+        />;
       default:
-        return <TaskBoard workspaceId={id} userRole={profile?.role} />;
+        return <TaskBoard 
+          workspaceId={id} 
+          userRole={profile?.role} 
+          key={`tasks-default-${dataVersion}`}
+        />;
     }
-  }, [activeTab, id, profile?.role, activities, workspaceMembers]);
+  }, [activeTab, id, profile?.role, activities, workspaceMembers, profile?.id, navigate, dataVersion]);
 
   const calculateCompletionRate = () => {
     if (workspaceStats.totalTasks === 0) return 0;
@@ -410,6 +794,116 @@ export default function WorkspaceDetails() {
 
   return (
     <>
+      {/* Custom Confirmation Modal */}
+      <AnimatePresence>
+        {showConfirmModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm"
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 20 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 20 }}
+              className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Modal Header */}
+              <div className="px-6 py-4 border-b border-gray-200 bg-gradient-to-r from-red-50 to-red-50/50">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center">
+                    <FiAlertTriangle className="w-5 h-5 text-red-600" />
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-bold text-gray-900">Remove Member</h3>
+                    <p className="text-sm text-gray-600">This action cannot be undone</p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Modal Content */}
+              <div className="p-6">
+                {isCleaningUp ? (
+                  <div className="text-center py-4">
+                    <div className="w-12 h-12 border-4 border-red-600 border-t-transparent rounded-full animate-spin mx-auto mb-3"></div>
+                    <p className="text-sm font-medium text-gray-900">{cleanupStatus}</p>
+                    <p className="text-xs text-gray-600 mt-1">Please wait...</p>
+                  </div>
+                ) : (
+                  <>
+                    <div className="flex items-center gap-3 mb-4 p-3 bg-yellow-50 rounded-lg">
+                      <FiAlertTriangle className="w-5 h-5 text-yellow-600 flex-shrink-0" />
+                      <p className="text-sm text-yellow-800">
+                        Are you sure you want to remove <span className="font-semibold">{memberToRemove?.name}</span> from this workspace?
+                      </p>
+                    </div>
+
+                    <div className="space-y-3 mb-6">
+                      <div className="p-3 bg-red-50 rounded-lg">
+                        <h4 className="text-sm font-semibold text-red-800 mb-2">This will permanently delete:</h4>
+                        <ul className="text-sm text-red-700 space-y-1">
+                          <li className="flex items-center gap-2">
+                            <FiTrash2 className="w-3 h-3" />
+                            All tasks assigned to {memberToRemove?.name}
+                          </li>
+                          <li className="flex items-center gap-2">
+                            <FiTrash2 className="w-3 h-3" />
+                            All tasks created by {memberToRemove?.name}
+                          </li>
+                          <li className="flex items-center gap-2">
+                            <FiTrash2 className="w-3 h-3" />
+                            All comments by {memberToRemove?.name}
+                          </li>
+                          <li className="flex items-center gap-2">
+                            <FiTrash2 className="w-3 h-3" />
+                            All attachments uploaded by {memberToRemove?.name}
+                          </li>
+                          <li className="flex items-center gap-2">
+                            <FiTrash2 className="w-3 h-3" />
+                            All activity history of {memberToRemove?.name}
+                          </li>
+                        </ul>
+                      </div>
+
+                      <div className="p-3 bg-gray-50 rounded-lg">
+                        <p className="text-xs text-gray-600">
+                          {memberToRemove?.id === profile?.id 
+                            ? "You will be redirected to the workspaces page."
+                            : "The user will lose all access to this workspace."}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex gap-3">
+                      <button
+                        onClick={() => {
+                          setShowConfirmModal(false);
+                          setMemberToRemove(null);
+                        }}
+                        className="flex-1 px-4 py-3 border border-gray-300 text-gray-700 font-medium rounded-lg hover:bg-gray-50 transition-colors"
+                        disabled={isCleaningUp}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={handleRemoveConfirmed}
+                        disabled={isCleaningUp}
+                        className="flex-1 px-4 py-3 bg-gradient-to-r from-red-600 to-red-700 text-white font-medium rounded-lg hover:from-red-700 hover:to-red-800 disabled:opacity-70 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2"
+                      >
+                        <FiTrash2 className="w-4 h-4" />
+                        {memberToRemove?.id === profile?.id ? "Leave Workspace" : "Remove Permanently"}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Header Section */}
       <div className="bg-white border-b border-gray-200">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
@@ -453,8 +947,6 @@ export default function WorkspaceDetails() {
           {/* Stats Cards */}
           {!loading && (
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-              
-
               <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
                 <div className="flex items-center gap-2 mb-1">
                   <FiUsers className="w-4 h-4 text-gray-600" />
@@ -462,7 +954,6 @@ export default function WorkspaceDetails() {
                 </div>
                 <p className="text-2xl font-bold text-gray-900">{workspaceStats.membersCount}</p>
               </div>
-
             </div>
           )}
         </div>
@@ -498,7 +989,7 @@ export default function WorkspaceDetails() {
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
         <AnimatePresence mode="wait">
           <motion.div
-            key={activeTab}
+            key={`${activeTab}-${dataVersion}`} // Add dataVersion to key for force re-render
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -10 }}
@@ -770,16 +1261,12 @@ export default function WorkspaceDetails() {
 
                               {isAdmin && member.user_id !== profile?.id && (
                                 <button
-                                  onClick={() => handleRemoveMember(member.user_id, member.user.name)}
-                                  disabled={removingMemberId === member.user_id}
+                                  onClick={() => showRemoveConfirmation(member.user_id, member.user.name)}
+                                  disabled={removingMemberId === member.user_id || isCleaningUp}
                                   className="p-2 hover:bg-red-100 text-red-600 rounded-lg transition-colors disabled:opacity-50"
                                   title="Remove member"
                                 >
-                                  {removingMemberId === member.user_id ? (
-                                    <div className="w-4 h-4 border-2 border-red-600 border-t-transparent rounded-full animate-spin"></div>
-                                  ) : (
-                                    <FiUserMinus className="w-4 h-4" />
-                                  )}
+                                  <FiUserMinus className="w-4 h-4" />
                                 </button>
                               )}
                             </div>
