@@ -702,6 +702,8 @@ export default function TaskDetailPanel({
         file_type: file.type
       });
 
+      window.location.reload();
+
     } catch (error) {
       console.error("Error uploading file:", error);
       alert("Failed to upload file");
