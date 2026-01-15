@@ -58,7 +58,7 @@ export default function TaskDetailPanel({
   const isAdminComment = userRole === "admin" || "sales_admin";
   
   // Check if current user is the task creator
-  const isTaskCreator = currentUserId === task?.created_by;
+  const isTaskCreator = currentUserId === task?.assigned_to;
   
   // Check if current user is the assigned user
   const isAssignedUser = currentUserId === task?.assigned_to;
