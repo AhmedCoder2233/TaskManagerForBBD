@@ -453,21 +453,7 @@ export default function WorkspaceDetails() {
           {/* Stats Cards */}
           {!loading && (
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-              <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
-                <div className="flex items-center gap-2 mb-1">
-                  <FiBarChart className="w-4 h-4 text-gray-600" />
-                  <p className="text-xs text-gray-600 font-medium">Total Tasks</p>
-                </div>
-                <p className="text-2xl font-bold text-gray-900">{workspaceStats.totalTasks}</p>
-              </div>
-
-              <div className="bg-emerald-50 rounded-lg p-4 border border-emerald-200">
-                <div className="flex items-center gap-2 mb-1">
-                  <FiCheckCircle className="w-4 h-4 text-emerald-600" />
-                  <p className="text-xs text-emerald-700 font-medium">Completed</p>
-                </div>
-                <p className="text-2xl font-bold text-emerald-700">{workspaceStats.completedTasks}</p>
-              </div>
+              
 
               <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
                 <div className="flex items-center gap-2 mb-1">
@@ -477,13 +463,6 @@ export default function WorkspaceDetails() {
                 <p className="text-2xl font-bold text-gray-900">{workspaceStats.membersCount}</p>
               </div>
 
-              <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
-                <div className="flex items-center gap-2 mb-1">
-                  <FiActivity className="w-4 h-4 text-gray-600" />
-                  <p className="text-xs text-gray-600 font-medium">Progress</p>
-                </div>
-                <p className="text-2xl font-bold text-gray-900">{calculateCompletionRate()}%</p>
-              </div>
             </div>
           )}
         </div>
