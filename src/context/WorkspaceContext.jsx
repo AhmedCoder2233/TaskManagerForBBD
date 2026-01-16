@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useState, useRef } from "react";
 import { supabase } from "../lib/supabase";
 import { AuthContext } from "./AuthContext";
 
@@ -8,9 +8,16 @@ export function WorkspaceProvider({ children }) {
   const { user, profile } = useContext(AuthContext);
   const [workspaces, setWorkspaces] = useState([]);
   const [loading, setLoading] = useState(true);
+  
+  // Add ref to track if workspaces have been fetched
+  const workspacesFetchedRef = useRef(false);
 
   const fetchWorkspaces = async () => {
-    if (!user) return;
+    if (!user) {
+      setWorkspaces([]);
+      setLoading(false);
+      return;
+    }
 
     setLoading(true);
 
@@ -108,38 +115,37 @@ export function WorkspaceProvider({ children }) {
     if (inviteError) throw inviteError;
   };
 
-  // In WorkspaceContext.jsx
-const fetchWorkspaceStats = async (workspaceId) => {
-  try {
-    // Fetch tasks stats
-    const { data: tasks, error: tasksError } = await supabase
-      .from('tasks')
-      .select('id, status')
-      .eq('workspace_id', workspaceId);
+  const fetchWorkspaceStats = async (workspaceId) => {
+    try {
+      // Fetch tasks stats
+      const { data: tasks, error: tasksError } = await supabase
+        .from('tasks')
+        .select('id, status')
+        .eq('workspace_id', workspaceId);
 
-    if (tasksError) throw tasksError;
+      if (tasksError) throw tasksError;
 
-    // Fetch pending invites
-    const { data: invites, error: invitesError } = await supabase
-      .from('workspace_invites')
-      .select('id')
-      .eq('workspace_id', workspaceId)
-      .eq('status', 'pending');
+      // Fetch pending invites
+      const { data: invites, error: invitesError } = await supabase
+        .from('workspace_invites')
+        .select('id')
+        .eq('workspace_id', workspaceId)
+        .eq('status', 'pending');
 
-    if (invitesError) throw invitesError;
+      if (invitesError) throw invitesError;
 
-    return {
-      totalTasks: tasks?.length || 0,
-      completedTasks: tasks?.filter(t => t.status === 'completed').length || 0,
-      pendingInvites: invites?.length || 0
-    };
-  } catch (error) {
-    console.error("Error fetching workspace stats:", error);
-    return null;
-  }
-};
+      return {
+        totalTasks: tasks?.length || 0,
+        completedTasks: tasks?.filter(t => t.status === 'completed').length || 0,
+        pendingInvites: invites?.length || 0
+      };
+    } catch (error) {
+      console.error("Error fetching workspace stats:", error);
+      return null;
+    }
+  };
 
-  // NEW: Function to accept invite and add user to workspace
+  // Function to accept invite and add user to workspace
   const acceptInvite = async (inviteId, workspaceId) => {
     try {
       if (!user) throw new Error("User not authenticated");
@@ -180,7 +186,20 @@ const fetchWorkspaceStats = async (workspaceId) => {
   };
 
   useEffect(() => {
-    fetchWorkspaces();
+    // Only fetch workspaces if:
+    // 1. User exists
+    // 2. Workspaces haven't been fetched yet
+    // 3. OR workspaces array is empty (fresh load)
+    if (user && (!workspacesFetchedRef.current || workspaces.length === 0)) {
+      fetchWorkspaces();
+      workspacesFetchedRef.current = true;
+    }
+    
+    // If user logs out, reset the ref
+    if (!user) {
+      workspacesFetchedRef.current = false;
+      setWorkspaces([]);
+    }
   }, [user, profile]);
 
   return (
@@ -191,7 +210,7 @@ const fetchWorkspaceStats = async (workspaceId) => {
         createWorkspace,
         inviteUserByEmail,
         fetchWorkspaces,
-        acceptInvite, // 👈 NEW: Added this function
+        acceptInvite,
         fetchWorkspaceStats
       }}
     >
