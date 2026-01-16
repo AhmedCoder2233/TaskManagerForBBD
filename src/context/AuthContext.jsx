@@ -1,265 +1,220 @@
-import { createContext, useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useState, useRef } from "react";
 import { supabase } from "../lib/supabase";
+import { AuthContext } from "./AuthContext";
 
-export const AuthContext = createContext({
-  user: null,
-  profile: null,
-  loading: true,
-  signUp: () => {},
-  signIn: () => {},
-  logout: () => {},
-  forgotPassword: () => {},
-  resetPassword: () => {},
-  isPasswordResetFlow: false,
-  setIsPasswordResetFlow: () => {}
-});
+export const WorkspaceContext = createContext();
 
-export function AuthProvider({ children }) {
-  const [user, setUser] = useState(null);
-  const [profile, setProfile] = useState(null);
+export function WorkspaceProvider({ children }) {
+  const { user, profile } = useContext(AuthContext);
+  const [workspaces, setWorkspaces] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [isPasswordResetFlow, setIsPasswordResetFlow] = useState(false);
+  
+  // Add ref to track if workspaces have been fetched
+  const workspacesFetchedRef = useRef(false);
 
-  /* ================= CHECK FOR PASSWORD RESET FLOW ================= */
-  useEffect(() => {
-    // Check URL hash for password recovery token
-    const hash = window.location.hash;
-    
-    if (hash.includes('type=recovery')) {
-      console.log("🔐 Password reset flow detected from URL");
-      setIsPasswordResetFlow(true);
-    }
-  }, []);
-
-  /* ================= SESSION ================= */
-  useEffect(() => {
-    const initializeAuth = async () => {
-      try {
-        const { data, error } = await supabase.auth.getSession();
-        
-        if (error) {
-          console.error("Session error:", error);
-          setLoading(false);
-          return;
-        }
-
-        const u = data.session?.user;
-
-        // If we're in password reset flow, handle specially
-        if (isPasswordResetFlow) {
-          console.log("⏸️  Password reset flow: Showing reset page");
-          // Keep user as null to show reset page
-          setUser(null);
-          setLoading(false);
-          return;
-        }
-
-        if (u && !u.email_confirmed_at) {
-          setUser(null);
-        } else {
-          setUser(u ?? null);
-        }
-
-        setLoading(false);
-      } catch (err) {
-        console.error("Auth initialization error:", err);
-        setLoading(false);
-      }
-    };
-
-    initializeAuth();
-
-    const { data: listener } = supabase.auth.onAuthStateChange(
-      async (event, session) => {
-        console.log("Auth state changed:", event);
-        
-        if (event === 'PASSWORD_RECOVERY') {
-          console.log("🔑 Password recovery event detected");
-          setIsPasswordResetFlow(true);
-          // Keep user null to show reset page
-          setUser(null);
-          return;
-        }
-
-        // If password was updated, clear the reset flow
-        if (event === 'USER_UPDATED') {
-          console.log("✅ Password updated, clearing reset flow");
-          setIsPasswordResetFlow(false);
-        }
-
-        const u = session?.user;
-
-        if (u && !u.email_confirmed_at) {
-          setUser(null);
-        } else {
-          setUser(u ?? null);
-        }
-      }
-    );
-
-    return () => {
-      if (listener?.subscription) {
-        listener.subscription.unsubscribe();
-      }
-    };
-  }, [isPasswordResetFlow]);
-
-  /* ================= PROFILE ================= */
-  useEffect(() => {
+  const fetchWorkspaces = async () => {
     if (!user) {
-      setProfile(null);
+      setWorkspaces([]);
+      setLoading(false);
       return;
     }
 
-    supabase
-      .from("profiles")
-      .select("*")
-      .eq("id", user.id)
-      .single()
-      .then(({ data, error }) => {
-        if (error || !data) {
-          console.log("Profile not found - logging out user");
-          supabase.auth.signOut();
-          setUser(null);
-          setProfile(null);
-          return;
-        }
-        
-        setProfile(data);
-      });
-  }, [user]);
+    setLoading(true);
 
-  /* ================= FORGOT PASSWORD ================= */
-  const forgotPassword = async (email) => {
-    try {
-      console.log("Sending password reset email to:", email);
-      
-      const redirectUrl = `${window.location.origin}/reset-password`;
-      console.log("Sending reset email with redirect:", redirectUrl);
-      
-      const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
-        redirectTo: redirectUrl,
-      });
+    const { data, error } = await supabase
+      .from("workspace_members")
+      .select(`
+        workspace_id,
+        workspaces (
+          id,
+          name,
+          created_at,
+          created_by
+        )
+      `)
+      .eq("user_id", user.id);
 
-      if (error) {
-        console.error("Reset link send error:", error);
-        throw new Error(`Failed to send reset link: ${error.message}`);
-      }
-
-      console.log("Reset email sent successfully");
-      return true;
-
-    } catch (err) {
-      console.error("Forgot password error:", err);
-      throw err;
+    if (error) {
+      console.error(error);
+      setWorkspaces([]);
+      setLoading(false);
+      return;
     }
+
+    const uniqueWorkspaces = data
+      ?.map((row) => row.workspaces)
+      .filter(Boolean);
+
+    setWorkspaces(uniqueWorkspaces || []);
+    setLoading(false);
   };
 
-  /* ================= RESET PASSWORD ================= */
-  const resetPassword = async (newPassword) => {
-    try {
-      const { error } = await supabase.auth.updateUser({
-        password: newPassword,
-      });
+  const createWorkspace = async (name) => {
+    if (profile.role !== "admin") return;
 
-      if (error) throw error;
+    const { data } = await supabase
+      .from("workspaces")
+      .insert({
+        name,
+        created_by: user.id,
+      })
+      .select()
+      .single();
 
-      setIsPasswordResetFlow(false);
-      return true;
-    } catch (err) {
-      console.error("Reset password error:", err);
-      throw err;
-    }
-  };
-
-  /* ================= SIGN UP ================= */
-  const signUp = async (email, password, name) => {
-    try {
-      const { data: existingProfile } = await supabase
-        .from("profiles")
-        .select("email")
-        .eq("email", email)
-        .maybeSingle();
-
-      if (existingProfile) {
-        throw new Error(
-          "An account with this email already exists. Please sign in instead."
-        );
-      }
-
-      const { data, error } = await supabase.auth.signUp({
-        email,
-        password,
-        options: {
-          emailRedirectTo: `https://bigbullcamp.com/`,
-          data: {
-            name: name,
-          },
-        },
-      });
-
-      if (error) throw error;
-
-      if (!data?.user) {
-        throw new Error("Failed to create user account");
-      }
-
-      try {
-        await supabase.rpc("accept_workspace_invites", {
-          user_email: email,
-          user_id: data.user.id,
-        });
-      } catch (err) {
-        console.warn("Invite acceptance skipped:", err);
-      }
-
-      return "VERIFY_EMAIL";
-    } catch (err) {
-      console.error("SignUp error:", err);
-      throw err;
-    }
-  };
-
-  /* ================= SIGN IN ================= */
-  const signIn = async (email, password) => {
-    const { data, error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
+    await supabase.from("workspace_members").insert({
+      workspace_id: data.id,
+      user_id: user.id,
     });
 
-    if (error) throw error;
+    fetchWorkspaces();
+  };
 
-    if (!data.user.email_confirmed_at) {
-      await supabase.auth.signOut();
-      throw new Error(
-        "Please verify your email first. Check your inbox for the verification link."
-      );
+  const inviteUserByEmail = async (workspaceId, email) => {
+    if (!email) {
+      throw new Error("Email is required");
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+
+    // 1️⃣ Check profile exists
+    const { data: profile, error: profileError } = await supabase
+      .from("profiles")
+      .select("id, email")
+      .eq("email", cleanEmail)
+      .single();
+
+    if (profileError || !profile) {
+      throw new Error("User with this email does not exist");
+    }
+
+    // 2️⃣ Prevent duplicate invite
+    const { data: existingInvite } = await supabase
+      .from("workspace_invites")
+      .select("id")
+      .eq("workspace_id", workspaceId)
+      .eq("email", cleanEmail)
+      .eq("status", "pending")
+      .single();
+
+    if (existingInvite) {
+      throw new Error("Invite already sent to this user");
+    }
+
+    // 3️⃣ Send invite
+    const { error: inviteError } = await supabase
+      .from("workspace_invites")
+      .insert({
+        workspace_id: workspaceId,
+        invited_user_id: profile.id,
+        email: cleanEmail,
+        invited_by: user.id,
+        role: "member",
+        status: "pending",
+      });
+
+    if (inviteError) throw inviteError;
+  };
+
+  const fetchWorkspaceStats = async (workspaceId) => {
+    try {
+      // Fetch tasks stats
+      const { data: tasks, error: tasksError } = await supabase
+        .from('tasks')
+        .select('id, status')
+        .eq('workspace_id', workspaceId);
+
+      if (tasksError) throw tasksError;
+
+      // Fetch pending invites
+      const { data: invites, error: invitesError } = await supabase
+        .from('workspace_invites')
+        .select('id')
+        .eq('workspace_id', workspaceId)
+        .eq('status', 'pending');
+
+      if (invitesError) throw invitesError;
+
+      return {
+        totalTasks: tasks?.length || 0,
+        completedTasks: tasks?.filter(t => t.status === 'completed').length || 0,
+        pendingInvites: invites?.length || 0
+      };
+    } catch (error) {
+      console.error("Error fetching workspace stats:", error);
+      return null;
     }
   };
 
-  /* ================= LOGOUT ================= */
-  const logout = async () => {
-    await supabase.auth.signOut();
-    setUser(null);
-    setProfile(null);
+  // Function to accept invite and add user to workspace
+  const acceptInvite = async (inviteId, workspaceId) => {
+    try {
+      if (!user) throw new Error("User not authenticated");
+
+      // 1️⃣ Update invite status to accepted
+      const { error: updateError } = await supabase
+        .from("workspace_invites")
+        .update({ status: "accepted" })
+        .eq("id", inviteId)
+        .eq("invited_user_id", user.id);
+
+      if (updateError) throw updateError;
+
+      // 2️⃣ Add user to workspace_members
+      const { error: memberError } = await supabase
+        .from("workspace_members")
+        .insert({
+          workspace_id: workspaceId,
+          user_id: user.id,
+          role: "member",
+        });
+
+      if (memberError) {
+        // If already a member, ignore duplicate error
+        if (memberError.code !== '23505') {
+          throw memberError;
+        }
+      }
+
+      // 3️⃣ Refresh workspaces list
+      await fetchWorkspaces();
+
+      return { success: true };
+    } catch (error) {
+      console.error("Error accepting invite:", error);
+      throw error;
+    }
   };
 
-  const contextValue = {
-    user, 
-    profile, 
-    loading, 
-    signUp, 
-    signIn, 
-    logout,
-    forgotPassword,
-    resetPassword,
-    isPasswordResetFlow,
-    setIsPasswordResetFlow
-  };
+  useEffect(() => {
+    // Only fetch workspaces if:
+    // 1. User exists
+    // 2. Workspaces haven't been fetched yet
+    // 3. OR workspaces array is empty (fresh load)
+    if (user && (!workspacesFetchedRef.current || workspaces.length === 0)) {
+      fetchWorkspaces();
+      workspacesFetchedRef.current = true;
+    }
+    
+    // If user logs out, reset the ref
+    if (!user) {
+      workspacesFetchedRef.current = false;
+      setWorkspaces([]);
+    }
+  }, [user, profile]);
 
   return (
-    <AuthContext.Provider value={contextValue}>
+    <WorkspaceContext.Provider
+      value={{
+        workspaces,
+        loading,
+        createWorkspace,
+        inviteUserByEmail,
+        fetchWorkspaces,
+        acceptInvite,
+        fetchWorkspaceStats
+      }}
+    >
       {children}
-    </AuthContext.Provider>
+    </WorkspaceContext.Provider>
   );
 }
